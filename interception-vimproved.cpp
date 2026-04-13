@@ -1,9 +1,16 @@
+#include <csignal>
 #include <ranges>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <linux/input.h>
 #include <yaml-cpp/yaml.h>
+
+volatile sig_atomic_t interception_enabled = 1;
+
+void toggle_handler(int) {
+  interception_enabled = !interception_enabled;
+}
 
 class Intercept;
 using Event = input_event;
@@ -13,6 +20,16 @@ using Intercepts = std::vector<Intercept*>;
 
 const auto KEY_STROKE_UP = 0;
 const auto KEY_STROKE_DOWN = 1;
+
+// if less than this many microseconds have elapsed since the last key event,
+// the user is considered to be "typing" and intercept keys act as plain taps
+//const auto TYPING_TIMEOUT_US = 100000L; // 100 ms
+const auto TYPING_TIMEOUT_US = 150000L; // 150 ms
+//const auto TYPING_TIMEOUT_US = 200000L; // 200 ms
+
+auto timeval_diff_us(struct timeval a, struct timeval b) -> long {
+  return (a.tv_sec - b.tv_sec) * 1000000L + (a.tv_usec - b.tv_usec);
+}
 
 auto is_keyup(Event input) -> bool { return input.value == KEY_STROKE_UP; }
 auto is_keydown(Event input) -> bool { return input.value == KEY_STROKE_DOWN; }
@@ -99,20 +116,29 @@ auto write_keytap(Key key) {
 
 class Intercept {
 public:
-  auto process(Event input) -> bool {
+  auto process(Event input, bool is_typing) -> bool {
     switch (state) {
-      case State::START: return process_start(input);
+      case State::START: return process_start(input, is_typing);
       case State::INTERCEPT_KEY_HELD: return process_intercept_held(input);
       case State::OTHER_KEY_HELD: return process_other_key_held(input);
+      case State::TYPING_PASSTHROUGH: return process_typing_passthrough(input);
       default: throw std::exception();
     }
+  }
+
+  virtual auto reset() -> void {
+    if (state == State::TYPING_PASSTHROUGH) {
+      write_events(key_event(KEY_STROKE_UP, tap), SYNC);
+    }
+    state = State::START;
+    emit_tap = true;
   }
 
 protected:
   Intercept(Key intercept, Key tap)
       : intercept{intercept}, tap{tap}, state{State::START}, emit_tap{true} {}
 
-  enum class State {START, INTERCEPT_KEY_HELD, OTHER_KEY_HELD};
+  enum class State {START, INTERCEPT_KEY_HELD, OTHER_KEY_HELD, TYPING_PASSTHROUGH};
   Key intercept;
   Key tap;
   State state;
@@ -125,8 +151,14 @@ protected:
     return input;
   }
 
-  auto process_start(Event input) -> bool {
+  auto process_start(Event input, bool is_typing) -> bool {
     if (is_intercept(input) && is_keydown(input)) {
+      if (is_typing) {
+        // user is actively typing — treat intercept key as a plain tap
+        write_events(remapped(input, tap));
+        state = State::TYPING_PASSTHROUGH;
+        return false;
+      }
       emit_tap = true;
       state = State::INTERCEPT_KEY_HELD;
       return false;
@@ -136,6 +168,21 @@ protected:
 
   virtual auto process_intercept_held(Event) -> bool = 0;
   virtual auto process_other_key_held(Event) -> bool { return false; }
+
+  auto process_typing_passthrough(Event input) -> bool {
+    if (is_intercept(input)) {
+      if (is_keyup(input)) {
+        write_events(remapped(input, tap));
+        state = State::START;
+        return false;
+      }
+      // repeat events — emit as tap repeat
+      write_events(remapped(input, tap));
+      return false;
+    }
+    // all other keys pass through normally
+    return true;
+  }
 };
 
 class Modifier : public Intercept {
@@ -147,6 +194,13 @@ private:
   Key modifier;
 
   using Intercept::remapped;
+
+  auto reset() -> void override {
+    if (state == State::INTERCEPT_KEY_HELD && !emit_tap) {
+      write_events(key_event(KEY_STROKE_UP, modifier), SYNC);
+    }
+    Intercept::reset();
+  }
 
   auto process_intercept_held(Event input) -> bool override {
     if (is_intercept(input)) {
@@ -181,6 +235,14 @@ private:
   auto is_mapped(Event input) -> bool { return mapping.contains(input.code); }
 
   auto is_held(Event input) -> bool { return held_keys.contains(input.code); }
+
+  auto reset() -> void override {
+    for (auto held_key : held_keys) {
+      write_events(key_event(KEY_STROKE_UP, mapping[held_key]), SYNC);
+    }
+    held_keys.clear();
+    Intercept::reset();
+  }
 
   using Intercept::remapped;
   auto remapped(Event input) -> Event { return remapped(input, mapping[input.code]); }
@@ -259,76 +321,68 @@ public:
 
 private:
   Intercepts intercepts;
+  bool was_enabled = true;
+  struct timeval last_key_time = {0, 0};
 
   auto intercept(Event input) -> void {
+    if (!interception_enabled) {
+      if (was_enabled) {
+        for (auto& i : intercepts) i->reset();
+        was_enabled = false;
+        std::fprintf(stderr, "interception-vimproved: disabled\n");
+      }
+      write_events(input);
+      return;
+    }
+    if (!was_enabled) {
+      was_enabled = true;
+      std::fprintf(stderr, "interception-vimproved: enabled\n");
+    }
     if (input.type == EV_MSC && input.code == MSC_SCAN) return;
-    if (input.type == EV_KEY && !processed(input)) return;
+    if (input.type == EV_KEY) {
+      auto is_typing = compute_is_typing(input);
+      if ((is_keydown(input) || is_keyup(input)) && !is_modifier(input.code)) {
+        last_key_time = input.time;
+      }
+      if (!processed(input, is_typing)) return;
+    }
     write_events(input);
   }
 
-  auto processed(Event input) -> bool {
+  auto compute_is_typing(Event input) -> bool {
+    if (last_key_time.tv_sec == 0 && last_key_time.tv_usec == 0) return false;
+    auto elapsed = timeval_diff_us(input.time, last_key_time);
+    return elapsed > 0 && elapsed < TYPING_TIMEOUT_US;
+  }
+
+  auto processed(Event input, bool is_typing) -> bool {
     auto processed = true;
     for (auto& intercept : intercepts) {
-      processed &= intercept->process(input);
+      processed &= intercept->process(input, is_typing);
     }
     return processed;
   }
 };
 
 auto default_config() -> Intercepts {
-  auto caps = new Modifier{KEY_CAPSLOCK, KEY_ESC, KEY_LEFTCTRL};
-  auto enter = new Modifier{KEY_ENTER, KEY_ENTER, KEY_RIGHTCTRL};
-  auto space = new Layer{KEY_SPACE, KEY_SPACE, Mapping {
-    // special chars
-    {KEY_E, KEY_ESC},
-    {KEY_D, KEY_DELETE},
-    {KEY_B, KEY_BACKSPACE},
-
+  auto caps = new Layer{KEY_CAPSLOCK, KEY_CAPSLOCK, Mapping {
     // vim home row
     {KEY_H, KEY_LEFT},
     {KEY_J, KEY_DOWN},
     {KEY_K, KEY_UP},
     {KEY_L, KEY_RIGHT},
-
-    // vim above home row
-    {KEY_Y, KEY_HOME},
-    {KEY_U, KEY_PAGEDOWN},
-    {KEY_I, KEY_PAGEUP},
-    {KEY_O, KEY_END},
-
-    // number row to F keys
-    {KEY_1, KEY_F1},
-    {KEY_2, KEY_F2},
-    {KEY_3, KEY_F3},
-    {KEY_4, KEY_F4},
-    {KEY_5, KEY_F5},
-    {KEY_6, KEY_F6},
-    {KEY_7, KEY_F7},
-    {KEY_8, KEY_F8},
-    {KEY_9, KEY_F9},
-    {KEY_0, KEY_F10},
-    {KEY_MINUS, KEY_F11},
-    {KEY_EQUAL, KEY_F12},
-
-    // xf86 audio
-    {KEY_M, KEY_MUTE},
-    {KEY_COMMA, KEY_VOLUMEDOWN},
-    {KEY_DOT, KEY_VOLUMEUP},
-
-    // FIXME: these never did anything even in original src tree (thinkpad x1 yoga)
-    // mouse navigation
-    {BTN_LEFT, BTN_BACK},
-    {BTN_RIGHT, BTN_FORWARD},
-
-    // PrtSc -> Context Menu
-    // FIXME: this is not working, even though `wev` says keycode 99 is Print
-    // {KEY_SYSRQ, KEY_CONTEXT_MENU},
   }};
+
+  auto enter = new Modifier{KEY_ENTER, KEY_ENTER, KEY_RIGHTCTRL};
+  auto space = new Modifier{KEY_SPACE, KEY_SPACE, KEY_LEFTMETA};
   return Intercepts{caps, enter, space};
 }
 
 auto read_config_or_default(int argc, char** argv) -> Intercepts {
-  if (argc < 2) return default_config();
+  if (argc < 2) {
+    std::fprintf(stderr, "No config file provided, using default config\n");
+    return default_config();
+  }
   // NOTE: modifiers must go first because layer.process_intercept_held
   // emits mapped key as soon as layer.process is called
   // if layer.process is run before modifier.process, the modifier is not emitted
@@ -378,5 +432,6 @@ auto read_config_or_default(int argc, char** argv) -> Intercepts {
 auto main(int argc, char** argv) -> int {
   std::setbuf(stdin, NULL);
   std::setbuf(stdout, NULL);
+  std::signal(SIGUSR1, toggle_handler);
   Interceptor(read_config_or_default(argc, argv)).event_loop();
 }
