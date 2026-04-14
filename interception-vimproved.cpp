@@ -1,5 +1,7 @@
+#include <array>
 #include <csignal>
 #include <ranges>
+#include <sys/time.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -21,15 +23,49 @@ using Intercepts = std::vector<Intercept*>;
 const auto KEY_STROKE_UP = 0;
 const auto KEY_STROKE_DOWN = 1;
 
-// if less than this many microseconds have elapsed since the last key event,
-// the user is considered to be "typing" and intercept keys act as plain taps
-//const auto TYPING_TIMEOUT_US = 100000L; // 100 ms
-const auto TYPING_TIMEOUT_US = 150000L; // 150 ms
-//const auto TYPING_TIMEOUT_US = 200000L; // 200 ms
-
 auto timeval_diff_us(struct timeval a, struct timeval b) -> long {
   return (a.tv_sec - b.tv_sec) * 1000000L + (a.tv_usec - b.tv_usec);
 }
+
+// number of recent keydown timestamps to track for typing detection
+const auto KEYDOWN_RECORD = 5;
+// a delta is considered a "gap" if it exceeds the average of the other deltas
+// by this factor — i.e. it breaks the typing rhythm
+const auto GAP_FACTOR = 2.0;
+
+class TypingDetector {
+public:
+  TypingDetector() {
+    gettimeofday(&last_time, NULL);
+    deltas.fill(10);
+  }
+
+  auto record(struct timeval time) -> void {
+    auto new_delta = timeval_diff_us(time, last_time);
+    total -= deltas[index];
+    total += new_delta;
+    deltas[index] = new_delta;
+    index = (index + 1) % DELTAS;
+    last_time = time;
+  }
+
+  // returns true if the recent key history looks like sustained typing
+  // (no gap / rhythm break among the last N+1 keydowns)
+  auto is_typing() const -> bool {
+    for (auto i = 0; i < DELTAS; ++i) {
+      auto others_avg = (total - deltas[i]) / (DELTAS - 1);
+      if (deltas[i] > static_cast<long>(others_avg * GAP_FACTOR)) return false;
+    }
+    return true;
+  }
+
+private:
+  static constexpr auto DELTAS = KEYDOWN_RECORD - 1;
+  struct timeval last_time;
+  std::array<long, KEYDOWN_RECORD - 1> deltas{};
+  int index = 0;
+  long total = DELTAS * 10; 
+};
 
 auto is_keyup(Event input) -> bool { return input.value == KEY_STROKE_UP; }
 auto is_keydown(Event input) -> bool { return input.value == KEY_STROKE_DOWN; }
@@ -154,7 +190,6 @@ protected:
   auto process_start(Event input, bool is_typing) -> bool {
     if (is_intercept(input) && is_keydown(input)) {
       if (is_typing) {
-        // user is actively typing — treat intercept key as a plain tap
         write_events(remapped(input, tap));
         state = State::TYPING_PASSTHROUGH;
         return false;
@@ -322,7 +357,7 @@ public:
 private:
   Intercepts intercepts;
   bool was_enabled = true;
-  struct timeval last_key_time = {0, 0};
+  TypingDetector typing_detector;
 
   auto intercept(Event input) -> void {
     if (!interception_enabled) {
@@ -340,19 +375,13 @@ private:
     }
     if (input.type == EV_MSC && input.code == MSC_SCAN) return;
     if (input.type == EV_KEY) {
-      auto is_typing = compute_is_typing(input);
-      if ((is_keydown(input) || is_keyup(input)) && !is_modifier(input.code)) {
-        last_key_time = input.time;
+      if (is_keydown(input)) {
+        typing_detector.record(input.time);
       }
+      auto is_typing = typing_detector.is_typing();
       if (!processed(input, is_typing)) return;
     }
     write_events(input);
-  }
-
-  auto compute_is_typing(Event input) -> bool {
-    if (last_key_time.tv_sec == 0 && last_key_time.tv_usec == 0) return false;
-    auto elapsed = timeval_diff_us(input.time, last_key_time);
-    return elapsed > 0 && elapsed < TYPING_TIMEOUT_US;
   }
 
   auto processed(Event input, bool is_typing) -> bool {
