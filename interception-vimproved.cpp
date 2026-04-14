@@ -364,14 +364,14 @@ private:
       if (was_enabled) {
         for (auto& i : intercepts) i->reset();
         was_enabled = false;
-        std::fprintf(stderr, "interception-vimproved: disabled\n");
+        std::fprintf(stderr, "interception disabled\n");
       }
       write_events(input);
       return;
     }
     if (!was_enabled) {
       was_enabled = true;
-      std::fprintf(stderr, "interception-vimproved: enabled\n");
+      std::fprintf(stderr, "interceptiongenabled\n");
     }
     if (input.type == EV_MSC && input.code == MSC_SCAN) return;
     if (input.type == EV_KEY) {

@@ -1,15 +1,12 @@
-# Interception plugin for vimproved input
+# Vimonized interception plugin
 
-~My hideous~ Humble, performant key remapping C++ code that should work on Linux for any input device that emits keys.
+@maricn's ~hideous~ humble, performant key remapping C++ code that should work on Linux for any input device that emits keys.
+With addition of typing detection and runtime toggle on signal.
 
 ## tl;dr;
-
-- space cadet: Maps space key into modifier (layer) key when held for long that transforms hjkl (vim homerow) into arrows, number row into F-keys, and a bit more. Space still emits SPACE key when tapped without holding.
-- caps2esc: Makes CAPS key send ESC when tapped and L_CTRL when held.
-- return2ctrl: Makes RETURN key send RETURN when tapped and R_CTRL when held.
-- other possible uses:
-  - Map CAPS to ESC when tapped and to LEFTMETA when held (useful with window managers like `dwm`)
-  - Declare any key (i.e. LEFTALT) to be a custom layer key when held
+ - Changed default config to suit my liking
+ - USR1 sent to the process toggles the passthrough mode, effectively enabling/disabling the remapping
+ - Time deltas of last couple keys are tracked to find the "gap" and determine if the user is typing or not, drastically reducing the chance of false positives. Assumption is that delta before intentional chord is noticeably higher than unintentional one.
 
 ## Requirements
 Basically any OS that works with `libevdev` (linux with kernel newer than 2.6.36), no matter what desktop environment, or even if any DE is used (yes, it works the same in X server instead of `xmodmap`, but also in plain terminal without graphical environment).
@@ -60,16 +57,13 @@ sleep 1 && timeout 10 udevmon -c /etc/interception-vimproved/config.yaml
 ```
 
 ## Why make this
-1. I have problems switching back and forth between my external keyboard and laptop keyboard. I customized my external keyboard with QMK to reduce my pinky strain and improve usability, but when I switch back to laptop keyboard, it's all lost, plus I have to fight my muscle memory.
-2. I used to use X.Org server with xinput, where I had an [xkbcomp based solution with xcape and xmodmap](https://github.com/maricn/dotfiles/blob/master/.xinitrc-keyboard-remap). However, since moving to wayland, that solution doesn't work anymore, and I needed to move to `libevdev` based solution.
-3. Enter [Interception Tools](https://gitlab.com/interception/linux/tools). It advertises itself as "a minimal composable infrastructure on top of libudev and libevdev". It, on one side, intercepts events from devices and writes them raw to `stdout`, and on the other side, it receives events from `stdin` and writes them to virtual input device.
-4. This plugin sits piped between Interception Tool's `intercept` and `uinput` (`intercept | interception-vimproved | uinput`). It interprets input from `intercept` and maps it to desired events which are then passed to `uinput` for emitting.
-
-- Other solutions I tried didn't behave as expected and produced unexpected artefacts.
-- In this solution, the use of sleeps is eliminated, there's no buffers for input and the interaction with output is minimized to reduce extra costs of writing to it often.
+- I absolutely hate curling my finger to reach Super, and interception tools is a nice way to remap it to Space.
+- Original interception-vimproved was producing a bunch of false positives because of me remapping Space, so I fixed it.
+- I wanted to learn C++ and this was a fun project to do so.
 
 ## Acknowledgments
 
+Thanks to [@maricn](https://github.com/maricn) for his original code and help with the project
 Kudos to [@dceluis](https://github.com/dceluis) and [@exprpapi](https://github.com/exprpapi) for their contributions.
 
 ### Related work / inspiration
